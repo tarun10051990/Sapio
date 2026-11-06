@@ -470,3 +470,202 @@ class RemoveRadarControl(NeoWebhookHandler):
         self.exp_handler.remove_eln_rows(CONTROLS_ENTRY, to_remove)
         self.rec_man.store_and_commit()
         return SapioWebhookResult(True, refresh_data=True)
+
+
+class RaDaRAddPlasmaControl(NeoWebhookHandler):
+    def execute(self, context: SapioWebhookContext) -> SapioWebhookResult:
+        current_step: str = context.active_step.get_name()
+        entry_options: dict[str, str] = self.exp_handler.get_step_options(CONTROLS_ENTRY)
+        parent_samples: list[ELNSampleDetailModel] = self.exp_handler.get_step_models(PARENT_SPECIMENS_ENTRY, ELNSampleDetailModel)
+        patient_sample_count: int = len(parent_samples)
+        json_data = self.__parse_JSON()
+        default_controls = json_data.get("patientSampleRecords")
+        if default_controls is None:
+            raise SapioUserErrorException(
+                f"Experiment option '{ADD_DEFAULT_PLASMA_CONTROLS_TAG}' is not set or invalid JSON. Please contact system administrator.")
+        eln_records: list[ELNExperimentDetailModel] = self.exp_handler.get_step_models(CONTROLS_ENTRY,
+                                                                                        ELNExperimentDetailModel)
+
+        def_control_types: list[str] = []
+        if entry_options.keys().__contains__(AUTO_INV_ITEM_CREATION_CONTROL_TYPE_TAG):
+            if entry_options[AUTO_INV_ITEM_CREATION_CONTROL_TYPE_TAG].__contains__("|"):
+                def_control_types = entry_options[AUTO_INV_ITEM_CREATION_CONTROL_TYPE_TAG].split("|")
+            else:
+                def_control_types.append(entry_options[AUTO_INV_ITEM_CREATION_CONTROL_TYPE_TAG])
+        records_inventory_parts: list[ConsumableModel] = self.rec_handler.query_models(ConsumableModel,
+                                                                                         ConsumableModel.CONSUMABLETYPE__FIELD_NAME.field_name,
+                                                                                         def_control_types)
+
+        exp_name: str = context.eln_experiment.notebook_experiment_name
+        if current_step == VISIBLE_PARENT_SPECIMEN_ENTRY:
+            if len(eln_records) > 0:
+                self.exp_handler.remove_eln_rows(CONTROLS_ENTRY, eln_records)
+            self.add_automate_controls(default_controls, exp_name, records_inventory_parts, patient_sample_count)
+
+        if current_step != VISIBLE_PARENT_SPECIMEN_ENTRY:
+            values_to_add: list[str] = []
+            total_parent_sample_count: int = len(parent_samples) + len(eln_records)
+            addControlRestriction = json_data.get("addControlRestriction")
+            sampleCountCondition = addControlRestriction.get("sampleCountCondition")
+            if sampleCountCondition.__contains__("[patientSamplesCount]"):
+                sampleCountCondition = sampleCountCondition.replace("[patientSamplesCount]", str(total_parent_sample_count))
+            result_cond = eval(sampleCountCondition)
+            if not result_cond:
+                raise SapioUserErrorException("Unable to add additional control as maximum batch size exceeded.")
+
+            success, tag_value = check_requirements(context, ADD_REMOVE_CONTROL_TAG)
+            if not success:
+                return SapioWebhookResult(False, display_text=tag_value)
+            if len(tag_value) > 0:
+                options: list[str] = [opt.strip() for opt in tag_value.split("|") if opt.strip()]
+                if len(options) == 1:
+                    # Single option, no dialog needed
+                    values_to_add = options
+                else:
+                    # Multiple options, show dialog
+                    values_to_add = self.callback.list_dialog("Please select a control type",
+                                                              options, multi_select=False)
+            elif tag_value is None or tag_value.strip() == "":
+                # Add another record based on selection from default rows, ie: no alternate selections
+                selected_records: list[ELNExperimentDetailModel] = self.inst_man.add_existing_records_of_type(
+                    context.data_record_list, ELNExperimentDetailModel)
+                if len(selected_records) <= 0:
+                    return SapioWebhookResult(False, display_text="No existing control records selected to add.")
+                for record in selected_records:
+                    values_to_add.append(record.get_ConsumableType_field())
+
+            if len(values_to_add) <= 0:
+                return SapioWebhookResult(False, display_text="No control types selected to add.")
+            for control_type in values_to_add:
+                if control_type in def_control_types:
+                    self.add_manual_default_control(exp_name, control_type, context)
+                else:
+                    selection_order: str = f"{zero_pad(str(len(eln_records) + 1), 2)}"
+                    new_control_record = self.exp_handler.add_eln_row(context.active_step.get_name())
+                    new_control_record.set_field_value(
+                        ELNExperimentDetailModel.CONSUMABLETYPE__FIELD_NAME.field_name, control_type)
+                    new_control_record.set_field_value(
+                        ELNExperimentDetailModel.SELECTIONORDER__FIELD_NAME.field_name, selection_order)
+
+        self.rec_man.store_and_commit()
+        return SapioWebhookResult(True)
+
+    def add_manual_default_control(self, exp_name: str, def_control_type: str, context: SapioWebhookContext):
+        eln_records: list[ELNExperimentDetailModel] = self.exp_handler.get_step_models(CONTROLS_ENTRY,
+                                                                                        ELNExperimentDetailModel)
+        new_controls = self.exp_handler.add_eln_rows(CONTROLS_ENTRY, 1)
+        criteria = AccessionSystemCriteriaPojo(f"{exp_name}")
+        acc_man = DataMgmtServer.get_accession_manager(self.user)
+        new_vals: list[str] = acc_man.accession_for_system(1, criteria)
+
+        ret_vals: list[str] = []
+        for val in new_vals:
+            ret_vals.append(f"{zero_pad(val, 2)}")
+        records_inventory_parts: list[ConsumableModel] = self.rec_handler.query_models(ConsumableModel,
+                                                                                         ConsumableModel.CONSUMABLETYPE__FIELD_NAME.field_name,
+                                                                                         def_control_type)
+        record_inv_part_model: ConsumableModel = records_inventory_parts.pop()
+        #[ExpName]_NTC_XX
+        for control in new_controls:
+            control.set_field_value(ELNExperimentDetailModel.CONSUMABLETYPE__FIELD_NAME.field_name, def_control_type)
+            val = ret_vals.pop()
+            vendor_lot_no = exp_name + "_NEC_" + val
+            selection_order: str = f"{zero_pad(str(len(eln_records)+1), 2)}"
+            control.set_field_value(ELNExperimentDetailModel.C_VENDORLOTNUMBER__FIELD_NAME.field_name, vendor_lot_no)
+            control.set_field_value(ELNExperimentDetailModel.SELECTIONORDER__FIELD_NAME.field_name, selection_order)
+            inventory_item: ConsumableItemModel = self.create_inventory_records(record_inv_part_model, vendor_lot_no, selection_order)
+            if inventory_item is not None:
+                control.set_field_value("C_ExpirationDate", inventory_item.get_field_value('ExpirationDate'))
+
+    def add_automate_controls(self, default_controls: Any, exp_name: str, records_inventory_parts: list[ConsumableModel],
+                              patient_sample_count: int):
+        for option in default_controls:
+            sampleCountCondition: str = option['sampleCountCondition']
+            if sampleCountCondition.__contains__("[patientSamplesCount]"):
+                sampleCountCondition = sampleCountCondition.replace("[patientSamplesCount]", str(patient_sample_count))
+            result_cond = eval(sampleCountCondition)
+            if result_cond:
+                controls = option['controls']
+                for control in controls:
+                    controlType = control['controlType']
+                    orderNo = control['orderNo']
+                    autoVendorLotNoCreation = control['autoVendorLotNoCreation']
+                    vendorLotNoFormat = control['vendorLotNoFormat']
+                    if autoVendorLotNoCreation == "true":
+                        self.add_default_control(exp_name, controlType, records_inventory_parts, vendorLotNoFormat, orderNo)
+                    else:
+                        new_controls = self.exp_handler.add_eln_rows(CONTROLS_ENTRY, 1)
+                        for new_control in new_controls:
+                            new_control.set_field_value(ELNExperimentDetailModel.CONSUMABLETYPE__FIELD_NAME.field_name, controlType)
+                            selection_order: str = f"{zero_pad(orderNo, 2)}"
+                            new_control.set_field_value(ELNExperimentDetailModel.SELECTIONORDER__FIELD_NAME.field_name,
+                                                        selection_order)
+
+    def __parse_JSON(self):
+        optionsJSON: str = ''
+        # Get JSON from Experiment Options
+        try:
+            optionsValue = self.exp_handler.get_step_options(CONTROLS_ENTRY).get(ADD_DEFAULT_PLASMA_CONTROLS_TAG)
+            if optionsValue:
+                optionsJSON = json.loads(optionsValue)
+        except:
+            raise SapioUserErrorException(
+                f"Experiment option '{ADD_DEFAULT_PLASMA_CONTROLS_TAG}' is not set or invalid JSON. Please contact system administrator.")
+        return optionsJSON
+
+    def add_default_control(self, exp_name: str, def_control_type: str, records_inventory_parts: list[ConsumableModel],
+                            vendor_lot_no_format: str, order: str):
+        new_controls = self.exp_handler.add_eln_rows(CONTROLS_ENTRY, 1)
+        criteria = AccessionSystemCriteriaPojo(f"{exp_name}")
+        acc_man = DataMgmtServer.get_accession_manager(self.user)
+        new_vals: list[str] = acc_man.accession_for_system(1, criteria)
+
+        ret_vals: list[str] = []
+        for val in new_vals:
+            ret_vals.append(f"{zero_pad(val, 2)}")
+        record_inv_part_model: ConsumableModel = self.retrieve_inv_model(records_inventory_parts, def_control_type)
+        #[ExpName]_NTC_XX
+        for control in new_controls:
+            control.set_field_value(ELNExperimentDetailModel.CONSUMABLETYPE__FIELD_NAME.field_name, def_control_type)
+            val = ret_vals.pop()
+            if vendor_lot_no_format.__contains__("[ExperimentName]"):
+                vendor_lot_no_format = vendor_lot_no_format.replace("[ExperimentName]", exp_name)
+            if vendor_lot_no_format.__contains__("XX"):
+                vendor_lot_no_format = vendor_lot_no_format.replace("XX", val)
+            selection_order: str = f"{zero_pad(order, 2)}"
+            control.set_field_value(ELNExperimentDetailModel.C_VENDORLOTNUMBER__FIELD_NAME.field_name, vendor_lot_no_format)
+            control.set_field_value(ELNExperimentDetailModel.SELECTIONORDER__FIELD_NAME.field_name, selection_order)
+            inventory_item = self.create_inventory_records(record_inv_part_model, vendor_lot_no_format, selection_order)
+            if inventory_item is not None:
+                control.set_field_value("C_ExpirationDate", inventory_item.get_field_value('ExpirationDate'))
+
+    def create_inventory_records(self, inv_type_model: ConsumableModel, vendor_lot_number: str, selection_order: str):
+        # Create ConsumableItem
+        new_consumable_item: ConsumableItemModel = self.inst_man.add_new_record_of_type(ConsumableItemModel)
+        new_consumable_item.set_C_VendorLotNumber_field(vendor_lot_number)
+        new_consumable_item.set_ConsumableName_field(inv_type_model.get_ConsumableName_field())
+        new_consumable_item.set_ConsumableType_field(inv_type_model.get_ConsumableType_field())
+
+        # Create Sample Model based on each reagent lot id
+        new_sample: SampleModel = self.inst_man.add_new_record_of_type(SampleModel)
+        #new_sample.set_C_MaterialType_field("Scraping Tube")
+        new_sample.set_ExemplarSampleType_field("Control")
+        new_sample.set_C_SelectionOrder_field(int(selection_order))
+        new_sample.add_child(new_consumable_item)
+        new_sample.add_parent(inv_type_model)
+        # Store and commit to get newly created Inventory samples
+        self.rec_man.store_and_commit()
+        record_consumable_items: list[ConsumableItemModel] = (
+            self.rec_handler.query_models(ConsumableItemModel,
+                                          ConsumableItemModel.C_VENDORLOTNUMBER__FIELD_NAME.field_name,
+                                          list(vendor_lot_number)))
+        inventory_item: ConsumableItemModel = record_consumable_items.pop() if len(
+            record_consumable_items) > 0 else None
+        return inventory_item
+
+    def retrieve_inv_model(self, inv_type_models: list[ConsumableModel], inventory_type: str):
+        for inv_type_model in inv_type_models:
+            inv_type = inv_type_model.get_ConsumableType_field()
+            if inv_type == inventory_type:
+                return inv_type_model
+        return None
