@@ -2,6 +2,8 @@
 # taken from screenshots (lines ~433-593 of the original file). Imports, constants, data type models and the
 # other handlers in this module (lines 1-432 and 594+) were not visible and are not reproduced here.
 
+from datetime import timedelta
+
 
 class AddRecordToPKDigestionScanRackPrepEntry(NeoWebhookHandler):
 
@@ -16,6 +18,11 @@ class AddRecordToPKDigestionScanRackPrepEntry(NeoWebhookHandler):
                 self.create_derivative_sample_record_placeholder(sample_models)
 
         controls: list[ELNExperimentDetailModel] = self.exp_handler.get_step_models(CONTROLS_ENTRY, ELNExperimentDetailModel)
+        controls_helper = RadarControlsHelper(self, context)
+        error = controls_helper.finalize_controls(controls, len(parent_samples))
+        if error is not None:
+            self.exp_handler.unlock_step(CONTROLS_ENTRY)
+            return SapioWebhookResult(False, display_text=error)
         if len(controls) > 0:
             sample_models = self.add_control_samples(controls, scan_rack_prep_details, len(parent_samples), PK_DIGESTION_SCAN_RACK_PREPARATION_ENTRY)
             self.add_control_samples(controls, scan_rack_prep_details, len(parent_samples), EXTRACTION_DNA_ISOLATES_ENTRY)
@@ -158,3 +165,308 @@ class AddRecordToPKDigestionScanRackPrepEntry(NeoWebhookHandler):
             if prep_detail.get_OtherSampleId_field() == sample_id:
                 return prep_detail
         return None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# P42-19563: RaDaR Plasma DNA Extraction - Controls entry
+# ---------------------------------------------------------------------------------------------------------------------
+
+CPL_POOL_CONTROL = "CPL-Pool (Positive Extraction Control)"
+NEC_CONTROL = "NEC (Negative Extraction Control)"
+DEFAULT_CONTROL_TYPES = [CPL_POOL_CONTROL, NEC_CONTROL]
+
+# Controls entry option holding the eligible control types, comma separated (AC2: configurable without code changes).
+CONTROL_TYPES_OPTION = "CONTROL TYPES"
+# Experiment option where the Parent Specimen Quantity (patients + controls) is written on submit (AC13).
+PARENT_SPECIMEN_QUANTITY_OPTION = "PARENT SPECIMEN QUANTITY"
+
+SMALL_RUN_MAX_PATIENTS = 22
+MAX_PARENT_SPECIMEN_QUANTITY = 48
+NEC_EXPIRATION_HOURS = 48
+
+# Controls entry (ELNExperimentDetail) field names.
+INVENTORY_ITEM_TYPE_FIELD = "InventoryItemType"
+INVENTORY_ITEM_ID_FIELD = "InventoryItemId"
+TUBE_BARCODE_FIELD = "ControlTubeBarCode"
+TUBE_BARCODE_ALT_FIELD = "TubeBarcode2"
+VENDOR_LOT_FIELD = "ConsumableLot"
+EXPIRATION_DATE_FIELD = "ExpirationDate"
+
+# Materials Management (ConsumableItem) field names used for generated NEC inventory.
+CONSUMABLE_TYPE_FIELD = "ConsumableType"
+CONSUMABLE_EXPIRATION_FIELD = "ExpirationDate"
+
+
+class RadarControlsHelper:
+    """Business rules for the RaDaR Plasma DNA Extraction Controls entry (P42-19563)."""
+
+    def __init__(self, handler: NeoWebhookHandler, context: SapioWebhookContext):
+        self.handler = handler
+        self.context = context
+        self.exp_handler = handler.exp_handler
+
+    # ----- configuration -----
+
+    def get_control_types(self) -> list[str]:
+        option: str | None = self.exp_handler.get_step_options(CONTROLS_ENTRY).get(CONTROL_TYPES_OPTION)
+        if not option:
+            return list(DEFAULT_CONTROL_TYPES)
+        return [t.strip() for t in option.split(",") if t.strip()]
+
+    @staticmethod
+    def is_positive(control_type: str | None) -> bool:
+        return control_type is not None and control_type.upper().startswith("CPL")
+
+    @staticmethod
+    def is_negative(control_type: str | None) -> bool:
+        return control_type is not None and control_type.upper().startswith("NEC")
+
+    def get_type_by_kind(self, positive: bool) -> str:
+        check = self.is_positive if positive else self.is_negative
+        return next((t for t in self.get_control_types() if check(t)), CPL_POOL_CONTROL if positive else NEC_CONTROL)
+
+    # ----- required minimums (AC3, AC4, AC15, AC16) -----
+
+    @staticmethod
+    def required_counts(patient_count: int) -> tuple[int, int]:
+        """Returns (required CPL-Pool, required NEC) for the given patient specimen count."""
+        if patient_count <= SMALL_RUN_MAX_PATIENTS:
+            return 1, 1
+        return 1, 2
+
+    def required_controls_message(self, patient_count: int) -> str:
+        cpl, nec = self.required_counts(patient_count)
+        return (f"An experiment with {patient_count} patient specimen(s) requires a minimum of "
+                f"{cpl} {self.get_type_by_kind(True)} and {nec} {self.get_type_by_kind(False)}. "
+                f"Required controls cannot be removed.")
+
+    def meets_minimum(self, controls: list[ELNExperimentDetailModel], patient_count: int) -> bool:
+        cpl, nec = self.required_counts(patient_count)
+        types = [c.get_field_value(INVENTORY_ITEM_TYPE_FIELD) for c in controls]
+        return (sum(1 for t in types if self.is_positive(t)) >= cpl
+                and sum(1 for t in types if self.is_negative(t)) >= nec)
+
+    # ----- quantities (AC12, AC13) -----
+
+    @staticmethod
+    def parent_specimen_quantity(patient_count: int, control_count: int) -> int:
+        return patient_count + control_count
+
+    def get_patient_count(self) -> int:
+        return len(self.exp_handler.get_step_models(PARENT_SPECIMENS_ENTRY, ELNSampleDetailModel))
+
+    def get_controls(self) -> list[ELNExperimentDetailModel]:
+        return self.exp_handler.get_step_models(CONTROLS_ENTRY, ELNExperimentDetailModel)
+
+    # ----- initialization (AC3, AC4) -----
+
+    def initialize_default_controls(self, patient_count: int) -> None:
+        """Creates the default control rows when the Controls entry has none yet."""
+        if len(self.get_controls()) > 0:
+            return
+        cpl, nec = self.required_counts(patient_count)
+        row_types = [self.get_type_by_kind(True)] * cpl + [self.get_type_by_kind(False)] * nec
+        for control_type in row_types:
+            row: ELNExperimentDetailModel = self.exp_handler.add_eln_row(CONTROLS_ENTRY, ELNExperimentDetailModel)
+            row.set_field_value(INVENTORY_ITEM_TYPE_FIELD, control_type)
+        self.handler.rec_man.store_and_commit()
+
+    # ----- validation (AC8, AC12, AC15, AC16, AC17) -----
+
+    @staticmethod
+    def get_tube_barcode(control: ELNExperimentDetailModel) -> str | None:
+        tube_barcode = control.get_field_value(TUBE_BARCODE_FIELD)
+        if not tube_barcode:
+            tube_barcode = control.get_field_value(TUBE_BARCODE_ALT_FIELD)
+        return tube_barcode or None
+
+    def validate(self, controls: list[ELNExperimentDetailModel], patient_count: int) -> str | None:
+        """Returns a user facing error message when the Controls entry cannot be submitted, otherwise None."""
+        errors: list[str] = []
+        types = self.get_control_types()
+        for index, control in enumerate(controls, start=1):
+            control_type = control.get_field_value(INVENTORY_ITEM_TYPE_FIELD)
+            if control_type not in types:
+                errors.append(f"Row {index}: '{control_type}' is not an eligible control type ({', '.join(types)}).")
+            elif self.get_tube_barcode(control) is None:
+                errors.append(f"Row {index}: TUBE BARCODE is required for {control_type}.")
+        if not self.meets_minimum(controls, patient_count):
+            errors.append(self.required_controls_message(patient_count))
+        quantity = self.parent_specimen_quantity(patient_count, len(controls))
+        if quantity > MAX_PARENT_SPECIMEN_QUANTITY:
+            errors.append(f"Parent Specimen Quantity is {quantity} ({patient_count} patient specimens + "
+                          f"{len(controls)} controls), maximum is {MAX_PARENT_SPECIMEN_QUANTITY}. "
+                          f"Remove {quantity - MAX_PARENT_SPECIMEN_QUANTITY} excess control(s) before submitting.")
+        return "\n".join(errors) if errors else None
+
+    # ----- submit (AC7, AC9, AC10, AC13, AC18) -----
+
+    def finalize_controls(self, controls: list[ELNExperimentDetailModel], patient_count: int) -> str | None:
+        """
+        Validates the Controls entry and populates the system generated values on submit. Returns an error message
+        when the entry cannot be submitted.
+        """
+        error = self.validate(controls, patient_count)
+        if error is not None:
+            return error
+        error = self.assign_positive_control_inventory([c for c in controls
+                                                         if self.is_positive(c.get_field_value(INVENTORY_ITEM_TYPE_FIELD))])
+        if error is not None:
+            return error
+        self.create_negative_control_inventory([c for c in controls
+                                                 if self.is_negative(c.get_field_value(INVENTORY_ITEM_TYPE_FIELD))])
+        self.exp_handler.add_experiment_options({
+            PARENT_SPECIMEN_QUANTITY_OPTION: str(self.parent_specimen_quantity(patient_count, len(controls)))
+        })
+        self.handler.rec_man.store_and_commit()
+        return None
+
+    def assign_positive_control_inventory(self, positives: list[ELNExperimentDetailModel]) -> str | None:
+        """AC7: the CPL-Pool INVENTORY ITEM ID is the inventory item that matches its TUBE BARCODE."""
+        if len(positives) == 0:
+            return None
+        barcodes = [self.get_tube_barcode(c) for c in positives]
+        samples: list[SampleModel] = self.handler.rec_handler.query_models(SampleModel, "TubeBarcode", barcodes)
+        self.handler.rel_man.load_children_of_type(samples, ConsumableItemModel)
+        samples_by_barcode: dict[str, SampleModel] = {s.get_TubeBarcode_field(): s for s in samples}
+        missing: list[str] = []
+        for control in positives:
+            barcode = self.get_tube_barcode(control)
+            sample = samples_by_barcode.get(barcode)
+            if sample is None:
+                missing.append(barcode)
+                continue
+            control.set_field_value(INVENTORY_ITEM_ID_FIELD, sample.get_SampleId_field())
+            consumable: ConsumableItemModel | None = sample.get_child_of_type(ConsumableItemModel)
+            if consumable is not None:
+                if not control.get_field_value(VENDOR_LOT_FIELD):
+                    control.set_field_value(VENDOR_LOT_FIELD, consumable.get_LotNumber_field())
+                if not control.get_field_value(EXPIRATION_DATE_FIELD):
+                    control.set_field_value(EXPIRATION_DATE_FIELD,
+                                            consumable.get_field_value(CONSUMABLE_EXPIRATION_FIELD))
+        if missing:
+            return f"No {self.get_type_by_kind(True)} inventory item found for TUBE BARCODE(s): {', '.join(missing)}."
+        return None
+
+    def create_negative_control_inventory(self, negatives: list[ELNExperimentDetailModel]) -> None:
+        """
+        AC7, AC9, AC10, AC18: each NEC gets the next system-wide inventory item ID, SPECIMEN TYPE = Control,
+        VENDOR LOT NUMBER = [Experiment Name]_NEC_XX, EXPIRATION DATE = experiment creation + 48 hours, and a
+        matching Materials Management inventory record.
+        """
+        new_negatives = [c for c in negatives if not c.get_field_value(INVENTORY_ITEM_ID_FIELD)]
+        if len(new_negatives) == 0:
+            return
+        experiment = self.context.eln_experiment
+        expiration = experiment.date_created + int(timedelta(hours=NEC_EXPIRATION_HOURS).total_seconds() * 1000)
+        used_lots = {c.get_field_value(VENDOR_LOT_FIELD) for c in negatives}
+        sample_ids: list[str] = self.handler.fnd_acc_man.get_accession_with_config_list(
+            SampleModel.DATA_TYPE_NAME, "SampleId", len(new_negatives))
+        nec_type = self.get_type_by_kind(False)
+        sequence = 0
+        for control, sample_id in zip(new_negatives, sample_ids):
+            sequence += 1
+            vendor_lot = f"{experiment.notebook_experiment_name}_NEC_{sequence:02d}"
+            while vendor_lot in used_lots:
+                sequence += 1
+                vendor_lot = f"{experiment.notebook_experiment_name}_NEC_{sequence:02d}"
+            used_lots.add(vendor_lot)
+            tube_barcode = self.get_tube_barcode(control)
+
+            sample: SampleModel = self.handler.inst_man.add_new_record_of_type(SampleModel)
+            sample.set_SampleId_field(sample_id)
+            sample.set_OtherSampleId_field(sample_id)
+            sample.set_TubeBarcode_field(tube_barcode)
+            sample.set_ExemplarSampleType_field("Control")
+
+            consumable: ConsumableItemModel = self.handler.inst_man.add_new_record_of_type(ConsumableItemModel)
+            consumable.set_LotNumber_field(vendor_lot)
+            consumable.set_field_value(CONSUMABLE_TYPE_FIELD, nec_type)
+            consumable.set_field_value(CONSUMABLE_EXPIRATION_FIELD, expiration)
+            sample.add_child(consumable)
+
+            control.set_field_value(INVENTORY_ITEM_ID_FIELD, sample_id)
+            control.set_field_value(VENDOR_LOT_FIELD, vendor_lot)
+            control.set_field_value(EXPIRATION_DATE_FIELD, expiration)
+
+    # ----- add / remove (AC11, AC12, AC14, AC15, AC16, AC17, AC18) -----
+
+    def locked_message(self) -> str | None:
+        if self.exp_handler.step_is_locked(CONTROLS_ENTRY):
+            return "The Controls entry is submitted. Select Unlock to Edit before adding or removing controls."
+        return None
+
+
+class InitializeRadarControlsEntry(NeoWebhookHandler):
+    """AC3, AC4: creates the default controls. Call from the Parent Specimens submit rule (radar-add-plasma-control)."""
+
+    def execute(self, context: SapioWebhookContext) -> SapioWebhookResult:
+        helper = RadarControlsHelper(self, context)
+        helper.initialize_default_controls(helper.get_patient_count())
+        return SapioWebhookResult(True, refresh_data=True)
+
+
+class ValidateRadarControlsEntry(NeoWebhookHandler):
+    """AC8, AC12, AC15, AC16, AC17: blocks submission of an invalid Controls entry."""
+
+    def execute(self, context: SapioWebhookContext) -> SapioWebhookResult:
+        helper = RadarControlsHelper(self, context)
+        error = helper.validate(helper.get_controls(), helper.get_patient_count())
+        if error is not None:
+            return SapioWebhookResult(False, display_text=error)
+        return SapioWebhookResult(True)
+
+
+class AddRadarControl(NeoWebhookHandler):
+    """AC11, AC12, AC18: Add Control toolbar button on the Controls entry."""
+
+    def execute(self, context: SapioWebhookContext) -> SapioWebhookResult:
+        helper = RadarControlsHelper(self, context)
+        locked = helper.locked_message()
+        if locked is not None:
+            self.callback.display_warning(locked)
+            return SapioWebhookResult(True)
+        patient_count = helper.get_patient_count()
+        controls = helper.get_controls()
+        quantity = helper.parent_specimen_quantity(patient_count, len(controls))
+        if quantity >= MAX_PARENT_SPECIMEN_QUANTITY:
+            self.callback.display_warning(f"Parent Specimen Quantity is already {quantity}. No more controls can be "
+                                          f"added (maximum {MAX_PARENT_SPECIMEN_QUANTITY}).")
+            return SapioWebhookResult(True)
+        selected = self.callback.list_dialog("Select Control Type", helper.get_control_types())
+        if not selected:
+            return SapioWebhookResult(True)
+        row: ELNExperimentDetailModel = self.exp_handler.add_eln_row(CONTROLS_ENTRY, ELNExperimentDetailModel)
+        row.set_field_value(INVENTORY_ITEM_TYPE_FIELD, selected[0])
+        self.rec_man.store_and_commit()
+        return SapioWebhookResult(True, refresh_data=True)
+
+
+class RemoveRadarControl(NeoWebhookHandler):
+    """AC14, AC15, AC16, AC17, AC18: Remove Control toolbar button on the Controls entry."""
+
+    def execute(self, context: SapioWebhookContext) -> SapioWebhookResult:
+        helper = RadarControlsHelper(self, context)
+        locked = helper.locked_message()
+        if locked is not None:
+            self.callback.display_warning(locked)
+            return SapioWebhookResult(True)
+        controls = helper.get_controls()
+        if len(controls) == 0:
+            return SapioWebhookResult(True)
+        labels: dict[str, ELNExperimentDetailModel] = {}
+        for index, control in enumerate(controls, start=1):
+            barcode = helper.get_tube_barcode(control) or "no barcode"
+            labels[f"{index}. {control.get_field_value(INVENTORY_ITEM_TYPE_FIELD)} ({barcode})"] = control
+        selected = self.callback.list_dialog("Select Controls to Remove", list(labels.keys()), multi_select=True)
+        if not selected:
+            return SapioWebhookResult(True)
+        to_remove = [labels[label] for label in selected]
+        remaining = [c for c in controls if c not in to_remove]
+        patient_count = helper.get_patient_count()
+        if not helper.meets_minimum(remaining, patient_count):
+            self.callback.display_warning(helper.required_controls_message(patient_count))
+            return SapioWebhookResult(True)
+        self.exp_handler.remove_eln_rows(CONTROLS_ENTRY, to_remove)
+        self.rec_man.store_and_commit()
+        return SapioWebhookResult(True, refresh_data=True)
